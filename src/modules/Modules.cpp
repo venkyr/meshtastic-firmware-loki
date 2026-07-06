@@ -48,6 +48,9 @@
 #include "modules/HopScalingModule.h"
 #endif
 #include "modules/TextMessageModule.h"
+#if defined(HELTEC_V3_HID)
+#include "HIDKeyboard.h"
+#endif
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
 #include "modules/TraceRouteModule.h"
 #endif
@@ -158,6 +161,17 @@ void setupModules()
 #endif
 #if !MESHTASTIC_EXCLUDE_TEXTMESSAGE
     textMessageModule = new TextMessageModule();
+#endif
+#if defined(HELTEC_V3_HID)
+    LOG_DEBUG("Creating HID Keyboard module...");
+    hidKeyboardModule = new HIDKeyboardModule();
+    if (!hidKeyboardModule->init()) {
+        LOG_ERROR("Failed to initialize HID Keyboard module");
+        delete hidKeyboardModule;
+        hidKeyboardModule = nullptr;
+    } else {
+        LOG_DEBUG("HID Keyboard module initialized successfully");
+    }
 #endif
 #if !MESHTASTIC_EXCLUDE_TRACEROUTE
     traceRouteModule = new TraceRouteModule();
