@@ -116,6 +116,10 @@ ProcessMessage HIDKeyboardModule::handleReceived(const meshtastic_MeshPacket &mp
 
     // EXEC <cmd> — send command to LokiMon via LokiBridge
     if (messageUpper.startsWith("EXEC ")) {
+        if (awaitingResponse) {
+            LOG_DEBUG("LokiBridge: EXEC discarded, previous command still pending");
+            return ProcessMessage::CONTINUE;
+        }
         String shellCmd = message.substring(5);
         shellCmd.trim();
         LOG_DEBUG("LokiBridge: EXEC command received over LoRa from 0x%x: %s", mp.from, shellCmd.c_str());
@@ -346,22 +350,9 @@ void HIDKeyboardModule::processLokiBridgeReport(const uint8_t *buf)
             break;
         }
 
-        case LB_CTRL_RESET: {
-            size_t dataLen = LB_DATA_PER_REPORT;
-            while (dataLen > 0 && data[dataLen - 1] == 0) dataLen--;
-            chunkBuf[0] = '\0';
-            if (dataLen > 0) {
-                memcpy(chunkBuf, data, dataLen);
-                chunkBuf[dataLen] = '\0';
-            }
-            LOG_DEBUG("LokiBridge: RESET ACK received: %s", chunkBuf);
-            sendLoRaResponse("LBRESET ACK");
-            awaitingResponse = false;
-            messageInProgress = false;
-            chunkLen = 0;
-            chunkCount = 0;
+        case LB_CTRL_RESET:
+            LOG_DEBUG("LokiBridge: RESET ACK received, discarding");
             break;
-        }
 
         default:
             LOG_WARN("LokiBridge: Unknown control byte: 0x%02X", ctrl);
