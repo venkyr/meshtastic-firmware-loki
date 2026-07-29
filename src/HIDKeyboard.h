@@ -44,6 +44,7 @@ class HIDKeyboardModule : public MeshModule
     void convertTextToKeystrokes(const String &text);
     void executeLoKeyScript(const String &script);
     void executeLoKeyCommand(const String &command);
+    void typePayload(const char *content);
     uint8_t stringToKeyCode(const String &key);
     void pressKeyCombo(uint8_t modifier, uint8_t key);
     void pressKeyComboMulti(uint8_t modifier1, uint8_t modifier2, uint8_t key);
@@ -54,18 +55,14 @@ class HIDKeyboardModule : public MeshModule
     void pressLeft();
     void pressRight();
 
-    // Macro commands
-    void executePSH();
-    void executeDeploy(const String &c2Server);
-
     // LokiBridge methods
     void sendLokiBridgeCmd(const char *cmdStr);
     void sendLokiBridgeReset();
     void processLokiBridgeReport(const uint8_t *buf);
     void flushChunk(bool isFinal);
     void sendLoRaResponse(const char *text);
+    void sendLoRaReply(const meshtastic_MeshPacket &mp, const char *text);
     String getLokiBridgeStatus();
-    void handleSerialLokiBridge();
 
     bool hidInitialized = false;
     bool hidReady = false;
@@ -77,12 +74,9 @@ class HIDKeyboardModule : public MeshModule
     bool    messageInProgress = false;
     int     chunkCount = 0;
     bool    awaitingResponse = false;
-    NodeNum lokiBridgeSender = 0; // node to send responses back to
+    bool    shellActive = false;
+    NodeNum lokiBridgeSender = 0;
 
-    // Serial command buffer for LBSTATUS/LBRESET
-    static constexpr size_t CMD_BUF_SIZE = 64;
-    char cmdBuf[CMD_BUF_SIZE] = {};
-    size_t cmdBufPos = 0;
 };
 
 extern HIDKeyboardModule *hidKeyboardModule;

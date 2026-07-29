@@ -1,0 +1,13 @@
+#pragma once
+
+constexpr const char MACRO_PSH_ELE[] = R"rawtxt(
+GUI r
+DELAY 2000
+STRING POWERSHELL.EXE
+DELAY 1000
+CTRL SHIFT ENTER
+DELAY 3000
+LEFT
+DELAY 1000
+ENTER
+)rawtxt";
